@@ -1,0 +1,1148 @@
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -1267,6 +1267,15 @@
+ 	  memory utilization by determining the page allocation ratio based on
+ 	  bandwidth differences between NUMA memories.
+ 
++config TOP_DOWN
++	bool "MPOL_TOP_DOWN memory policy"
++	depends on NUMA && X86 && 64BIT
++	default n
++	help
++	  Adds the MPOL_TOP_DOWN memory policy used by MigFlow: new pages are
++	  allocated from the nodes of the policy in the given order (fastest
++	  tier first), falling back to any node only when all of them are full.
++
+ source "mm/damon/Kconfig"
+ 
+ endmenu
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -374,6 +374,11 @@
+ 				return ERR_PTR(-EINVAL);
+ 		}
+ #endif
++#ifdef CONFIG_TOP_DOWN
++	} else if (mode == MPOL_TOP_DOWN) {
++		if (nodes_empty(*nodes))
++			return ERR_PTR(-EINVAL);
++#endif
+ 	} else if (nodes_empty(*nodes))
+ 		return ERR_PTR(-EINVAL);
+ 	policy = kmem_cache_alloc(policy_cache, GFP_KERNEL);
+@@ -503,6 +508,12 @@
+ 		.rebind = mpol_rebind_nodemask,
+ 	},
+ #endif
++#ifdef CONFIG_TOP_DOWN
++	[MPOL_TOP_DOWN] = {
++		.create = mpol_new_nodemask,
++		.rebind = mpol_rebind_preferred,
++	},
++#endif
+ 	[MPOL_PREFERRED] = {
+ 		.create = mpol_new_preferred,
+ 		.rebind = mpol_rebind_preferred,
+@@ -1020,6 +1031,9 @@
+ #endif
+ 	case MPOL_PREFERRED:
+ 	case MPOL_PREFERRED_MANY:
++#ifdef CONFIG_TOP_DOWN
++	case MPOL_TOP_DOWN:
++#endif
+ 		*nodes = p->nodes;
+ 		break;
+ 	case MPOL_LOCAL:
+@@ -1680,7 +1694,7 @@
+ 			prev = vma;
+ 			continue;
+ 		}
+-		if (old->mode != MPOL_BIND && old->mode != MPOL_PREFERRED_MANY) {
++		if (old->mode != MPOL_BIND && old->mode != MPOL_PREFERRED_MANY && old->mode != MPOL_TOP_DOWN) {
+ 			err = -EOPNOTSUPP;
+ 			break;
+ 		}
+@@ -2227,7 +2241,7 @@
+ 		cpuset_nodemask_valid_mems_allowed(&policy->nodes))
+ 		return &policy->nodes;
+ 
+-	if (mode == MPOL_PREFERRED_MANY)
++	if (mode == MPOL_PREFERRED_MANY || mode == MPOL_TOP_DOWN)
+ 		return &policy->nodes;
+ 
+ 	return NULL;
+@@ -2254,7 +2268,8 @@
+ 	}
+ 
+ 	if ((policy->mode == MPOL_BIND ||
+-	     policy->mode == MPOL_PREFERRED_MANY) &&
++	     policy->mode == MPOL_PREFERRED_MANY ||
++		 policy->mode == MPOL_TOP_DOWN) &&
+ 	    policy->home_node != NUMA_NO_NODE)
+ 		return policy->home_node;
+ 
+@@ -2344,6 +2359,9 @@
+ 
+ 	case MPOL_BIND:
+ 	case MPOL_PREFERRED_MANY:
++#ifdef CONFIG_TOP_DOWN
++	case MPOL_TOP_DOWN:
++#endif
+ 	{
+ 		struct zoneref *z;
+ 
+@@ -2524,6 +2542,10 @@
+ 		nid = policy_node(gfp_flags, *mpol, numa_node_id());
+ 		if (mode == MPOL_BIND || mode == MPOL_PREFERRED_MANY)
+ 			*nodemask = &(*mpol)->nodes;
++#ifdef CONFIG_TOP_DOWN
++		if (mode == MPOL_TOP_DOWN)
++			*nodemask = &(*mpol)->nodes;
++#endif
+ 	}
+ 	return nid;
+ }
+@@ -2558,6 +2580,9 @@
+ 	case MPOL_PREFERRED_MANY:
+ 	case MPOL_BIND:
+ 	case MPOL_INTERLEAVE:
++#ifdef CONFIG_TOP_DOWN
++	case MPOL_TOP_DOWN:
++#endif
+ 		*mask = mempolicy->nodes;
+ 		break;
+ 
+@@ -2665,6 +2690,52 @@
+ 	return page;
+ }
+ 
++#ifdef CONFIG_TOP_DOWN
++#define ALLOC_MARGIN_KBYTES (500 * 1024L)
++static struct page *alloc_pages_top_down(gfp_t gfp, unsigned int order,
++						struct mempolicy *pol)
++{
++	struct page *page;
++	gfp_t soft_gfp;
++	nodemask_t nmask;
++	int i;
++	int curnid;
++	struct zone *z;
++	long fp_kbytes;
++
++	/*
++	 * Two passes: first walk the policy nodes in tier order and take the
++	 * first one with enough free memory, without direct reclaim; then fall
++	 * back to any online node.
++	 */
++	for (curnid = 0; curnid < MAX_NUMNODES; curnid++) {
++		if (!node_online(curnid) || !node_isset(curnid, pol->nodes))
++			continue;
++
++		z = zonelist_zone(first_zones_zonelist(node_zonelist(curnid, GFP_KERNEL), gfp_zone(GFP_KERNEL), NULL));
++		fp_kbytes = K(zone_page_state(z, NR_FREE_PAGES));
++		if (fp_kbytes < ALLOC_MARGIN_KBYTES)
++			continue;
++
++		init_nodemask_of_node(&nmask, curnid);
++		page = __alloc_pages(gfp, order, curnid, &nmask);
++		if (page)
++			return page;
++	}
++
++	nodes_clear(nmask);
++	for_each_online_node(i)
++	    node_set(i, nmask);
++
++	soft_gfp = gfp | __GFP_NOWARN;
++	soft_gfp &= ~(__GFP_DIRECT_RECLAIM | __GFP_NOFAIL);
++
++	page = __alloc_pages(soft_gfp, order, numa_node_id(), &nmask);
++
++	return page;
++}
++#endif
++
+ /**
+  * vma_alloc_folio - Allocate a folio for a VMA.
+  * @gfp: GFP flags.
+@@ -2734,6 +2805,20 @@
+ 		goto out;
+ 	}
+ 
++#ifdef CONFIG_TOP_DOWN
++	if (pol->mode == MPOL_TOP_DOWN) {
++		struct page *page;
++
++		gfp |= __GFP_COMP;
++		page = alloc_pages_top_down(gfp, order, pol);
++		mpol_cond_put(pol);
++		folio = (struct folio *)page;
++		if (folio && order > 1)
++			folio_prep_large_rmappable(folio);
++		goto out;
++	}
++#endif
++
+ 	if (unlikely(IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && hugepage)) {
+ 		int hpage_node = node;
+ 
+@@ -2818,6 +2903,10 @@
+ 	else if (pol->mode == MPOL_PREFERRED_MANY)
+ 		page = alloc_pages_preferred_many(gfp, order,
+ 				  policy_node(gfp, pol, numa_node_id()), pol);
++#ifdef CONFIG_TOP_DOWN
++	else if (pol->mode == MPOL_TOP_DOWN)
++		page = alloc_pages_top_down(gfp, order, pol);
++#endif
+ 	else
+ 		page = __alloc_pages(gfp, order,
+ 				policy_node(gfp, pol, numa_node_id()),
+@@ -2893,6 +2982,47 @@
+ 	return nr_allocated;
+ }
+ 
++#ifdef CONFIG_TOP_DOWN
++static unsigned long alloc_pages_bulk_array_top_down(gfp_t gfp,
++		struct mempolicy *pol, unsigned long nr_pages,
++		struct page **page_array)
++{
++	gfp_t soft_gfp;
++	unsigned long nr_allocated = 0;
++	nodemask_t nmask;
++	int curnid;
++
++	for (curnid = 0; curnid < MAX_NUMNODES; curnid++) {
++		if (!node_online(curnid) || !node_isset(curnid, pol->nodes))
++			continue;
++		init_nodemask_of_node(&nmask, curnid);
++		if (nr_allocated < nr_pages) {
++			nr_allocated += __alloc_pages_bulk(gfp, curnid, &nmask, nr_pages - nr_allocated, NULL, page_array + nr_allocated);
++		}
++	}
++
++	if (nr_allocated < nr_pages) {
++		int i;
++
++		nodes_clear(nmask);
++		for_each_online_node(i)
++		    node_set(i, nmask);
++
++		soft_gfp = gfp | __GFP_NOWARN;
++		soft_gfp &= ~(__GFP_DIRECT_RECLAIM | __GFP_NOFAIL);
++
++		nr_allocated += __alloc_pages_bulk(soft_gfp,
++				numa_node_id(),
++				&nmask,
++				nr_pages - nr_allocated,
++				NULL,
++				page_array + nr_allocated);
++
++	}
++	return nr_allocated;
++}
++#endif
++
+ /* alloc pages bulk and mempolicy should be considered at the
+  * same time in some situation such as vmalloc.
+  *
+@@ -2915,6 +3045,11 @@
+ 		return alloc_pages_bulk_array_preferred_many(gfp,
+ 				numa_node_id(), pol, nr_pages, page_array);
+ 
++#ifdef CONFIG_TOP_DOWN
++	if (pol->mode == MPOL_TOP_DOWN)
++		return alloc_pages_bulk_array_top_down(gfp, pol, nr_pages, page_array);
++#endif
++
+ 	return __alloc_pages_bulk(gfp, policy_node(gfp, pol, numa_node_id()),
+ 				  policy_nodemask(gfp, pol), nr_pages, NULL,
+ 				  page_array);
+@@ -3020,6 +3155,9 @@
+ 	case MPOL_INTERLEAVE:
+ 	case MPOL_PREFERRED:
+ 	case MPOL_PREFERRED_MANY:
++#ifdef CONFIG_TOP_DOWN
++	case MPOL_TOP_DOWN:
++#endif
+ 		return !!nodes_equal(a->nodes, b->nodes);
+ #ifdef CONFIG_INTERLEAVE_WEIGHT
+ 	case MPOL_INTERLEAVE_WEIGHT:
+@@ -3190,6 +3328,9 @@
+ 		fallthrough;
+ 
+ 	case MPOL_PREFERRED_MANY:
++#ifdef CONFIG_TOP_DOWN
++	case MPOL_TOP_DOWN:
++#endif
+ 		/*
+ 		 * use current page if in policy nodemask,
+ 		 * else select nearest allowed node, if any.
+@@ -3604,6 +3745,9 @@
+ #endif
+ 	[MPOL_LOCAL]      = "local",
+ 	[MPOL_PREFERRED_MANY]  = "prefer (many)",
++#ifdef CONFIG_TOP_DOWN
++	[MPOL_TOP_DOWN]    = "top_down"
++#endif
+ };
+ 
+ 
+@@ -3687,6 +3831,9 @@
+ 		goto out;
+ 	case MPOL_PREFERRED_MANY:
+ 	case MPOL_BIND:
++#ifdef CONFIG_TOP_DOWN
++	case MPOL_TOP_DOWN:
++#endif
+ 		/*
+ 		 * Insist on a nodelist
+ 		 */
+@@ -3778,6 +3925,9 @@
+ #ifdef CONFIG_INTERLEAVE_WEIGHT
+ 	case MPOL_INTERLEAVE_WEIGHT:
+ #endif
++#ifdef CONFIG_TOP_DOWN
++	case MPOL_TOP_DOWN:
++#endif
+ 		nodes = pol->nodes;
+ 		break;
+ 	default:
+--- a/include/linux/mempolicy.h
++++ b/include/linux/mempolicy.h
+@@ -46,7 +46,7 @@
+ 	unsigned short mode; 	/* See MPOL_* above */
+ 	unsigned short flags;	/* See set_mempolicy() MPOL_F_* above */
+ 	nodemask_t nodes;	/* interleave/bind/perfer */
+-	int home_node;		/* Home node to use for MPOL_BIND and MPOL_PREFERRED_MANY */
++	int home_node;		/* Home node to use for MPOL_BIND, MPOL_PREFERRED_MANY and MPOL_TOP_DOWN */
+ #ifdef CONFIG_INTERLEAVE_WEIGHT
+ 	struct list_head weight_list;
+ 	unsigned int weight_repeat;
+--- a/include/uapi/linux/mempolicy.h
++++ b/include/uapi/linux/mempolicy.h
+@@ -24,6 +24,7 @@
+ 	MPOL_LOCAL,
+ 	MPOL_PREFERRED_MANY,
+ 	MPOL_INTERLEAVE_WEIGHT,
++	MPOL_TOP_DOWN,
+ 	MPOL_MAX,	/* always last member of enum */
+ };
+ 
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -1706,6 +1706,7 @@
+ extern void perf_event_task_tick(void);
+ extern int perf_event_account_interrupt(struct perf_event *event);
+ extern int perf_event_period(struct perf_event *event, u64 value);
++extern u64 perf_event_get_period(struct perf_event *event);
+ extern u64 perf_event_pause(struct perf_event *event, bool reset);
+ #else /* !CONFIG_PERF_EVENTS: */
+ static inline void *
+@@ -1789,6 +1790,10 @@
+ {
+ 	return -EINVAL;
+ }
++static inline u64 perf_event_get_period(struct perf_event *event)
++{
++	return -EINVAL;
++}
+ static inline u64 perf_event_pause(struct perf_event *event, bool reset)
+ {
+ 	return 0;
+@@ -1906,4 +1911,8 @@
+ }
+ #endif
+ 
++extern int kmig__perf_event_init(struct perf_event *event, unsigned long nr_pages);
++extern int kmig__perf_event_open(struct perf_event_attr *attr_ptr, pid_t pid,
++	int cpu, int group_fd, unsigned long flags);
++
+ #endif /* _LINUX_PERF_EVENT_H */
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -5789,6 +5789,17 @@
+ 	return 0;
+ }
+ 
++static u64 _perf_event_get_period(struct perf_event *event)
++{
++	if (!is_sampling_event(event))
++		return -EINVAL;
++
++	if (event->attr.freq)
++		return -EINVAL;
++
++	return event->attr.sample_period;
++}
++
+ int perf_event_period(struct perf_event *event, u64 value)
+ {
+ 	struct perf_event_context *ctx;
+@@ -5802,6 +5813,19 @@
+ }
+ EXPORT_SYMBOL_GPL(perf_event_period);
+ 
++u64 perf_event_get_period(struct perf_event *event)
++{
++	struct perf_event_context *ctx;
++	u64 ret;
++
++	ctx = perf_event_ctx_lock(event);
++	ret = _perf_event_get_period(event);
++	perf_event_ctx_unlock(event, ctx);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(perf_event_get_period);
++
+ static const struct file_operations perf_fops;
+ 
+ static inline int perf_fget_light(int fd, struct fd *p)
+@@ -13808,3 +13832,438 @@
+ #endif /* CONFIG_CGROUP_PERF */
+ 
+ DEFINE_STATIC_CALL_RET0(perf_snapshot_branch_stack, perf_snapshot_branch_stack_t);
++
++/* allocates perf_buffer instead of calling perf_mmap() */
++int kmig__perf_event_init(struct perf_event *event, unsigned long nr_pages)
++{
++    struct perf_buffer *rb = NULL;
++    int ret = 0, flags = 0;
++
++    if (event->cpu == -1 && event->attr.inherit)
++		return -EINVAL;
++
++    ret = security_perf_event_read(event);
++    if (ret)
++		return ret;
++
++    if (nr_pages != 0 && !is_power_of_2(nr_pages))
++		return -EINVAL;
++
++    WARN_ON_ONCE(event->ctx->parent_ctx);
++    mutex_lock(&event->mmap_mutex);
++
++    WARN_ON(event->rb);
++
++    rb = rb_alloc(nr_pages,
++	    event->attr.watermark ? event->attr.wakeup_watermark : 0,
++	    event->cpu, flags);
++    if (!rb) {
++		ret = -ENOMEM;
++		goto unlock;
++    }
++
++    ring_buffer_attach(event, rb);
++    perf_event_init_userpage(event);
++    perf_event_update_userpage(event);
++
++unlock:
++    if (!ret) {
++		atomic_inc(&event->mmap_count);
++    }
++    mutex_unlock(&event->mmap_mutex);
++    return ret;
++}
++EXPORT_SYMBOL_GPL(kmig__perf_event_init);
++
++/* In-kernel variant of sys_perf_event_open() taking an attr struct directly. */
++int kmig__perf_event_open(struct perf_event_attr *attr_ptr, pid_t pid,
++	int cpu, int group_fd, unsigned long flags)
++{
++	struct perf_event *group_leader = NULL, *output_event = NULL;
++	struct perf_event_pmu_context *pmu_ctx;
++	struct perf_event *event, *sibling;
++	struct perf_event_attr attr;
++	struct perf_event_context *ctx;
++	struct file *event_file = NULL;
++	struct fd group = {NULL, 0};
++	struct task_struct *task = NULL;
++	struct pmu *pmu;
++	int event_fd;
++	int move_group = 0;
++	int err;
++	int f_flags = O_RDWR;
++	int cgroup_fd = -1;
++
++	/* for future expandability... */
++	if (flags & ~PERF_FLAG_ALL)
++		return -EINVAL;
++
++	attr = *attr_ptr;
++
++	/* Do we allow access to perf_event_open(2) ? */
++	err = security_perf_event_open(&attr, PERF_SECURITY_OPEN);
++	if (err)
++		return err;
++
++	if (!attr.exclude_kernel) {
++		err = perf_allow_kernel(&attr);
++		if (err)
++			return err;
++	}
++
++	if (attr.namespaces) {
++		if (!perfmon_capable())
++			return -EACCES;
++	}
++
++	if (attr.freq) {
++		if (attr.sample_freq > sysctl_perf_event_sample_rate)
++			return -EINVAL;
++	} else {
++		if (attr.sample_period & (1ULL << 63))
++			return -EINVAL;
++	}
++
++	/* Only privileged users can get physical addresses */
++	if ((attr.sample_type & PERF_SAMPLE_PHYS_ADDR)) {
++		err = perf_allow_kernel(&attr);
++		if (err)
++			return err;
++	}
++
++	/* REGS_INTR can leak data, lockdown must prevent this */
++	if (attr.sample_type & PERF_SAMPLE_REGS_INTR) {
++		err = security_locked_down(LOCKDOWN_PERF);
++		if (err)
++			return err;
++	}
++
++	/*
++	 * In cgroup mode, the pid argument is used to pass the fd
++	 * opened to the cgroup directory in cgroupfs. The cpu argument
++	 * designates the cpu on which to monitor threads from that
++	 * cgroup.
++	 */
++	if ((flags & PERF_FLAG_PID_CGROUP) && (pid == -1 || cpu == -1))
++		return -EINVAL;
++
++	if (flags & PERF_FLAG_FD_CLOEXEC)
++		f_flags |= O_CLOEXEC;
++
++	event_fd = get_unused_fd_flags(f_flags);
++	if (event_fd < 0)
++		return event_fd;
++
++	if (group_fd != -1) {
++		err = perf_fget_light(group_fd, &group);
++		if (err)
++			goto err_fd;
++		group_leader = group.file->private_data;
++		if (flags & PERF_FLAG_FD_OUTPUT)
++			output_event = group_leader;
++		if (flags & PERF_FLAG_FD_NO_GROUP)
++			group_leader = NULL;
++	}
++
++	if (pid != -1 && !(flags & PERF_FLAG_PID_CGROUP)) {
++		task = find_lively_task_by_vpid(pid);
++		if (IS_ERR(task)) {
++			err = PTR_ERR(task);
++			goto err_group_fd;
++		}
++	}
++
++	if (task && group_leader &&
++	    group_leader->attr.inherit != attr.inherit) {
++		err = -EINVAL;
++		goto err_task;
++	}
++
++	if (flags & PERF_FLAG_PID_CGROUP)
++		cgroup_fd = pid;
++
++	event = perf_event_alloc(&attr, cpu, task, group_leader, NULL,
++				 NULL, NULL, cgroup_fd);
++	if (IS_ERR(event)) {
++		err = PTR_ERR(event);
++		goto err_task;
++	}
++
++	if (is_sampling_event(event)) {
++		if (event->pmu->capabilities & PERF_PMU_CAP_NO_INTERRUPT) {
++			err = -EOPNOTSUPP;
++			goto err_alloc;
++		}
++	}
++
++	/*
++	 * Special case software events and allow them to be part of
++	 * any hardware group.
++	 */
++	pmu = event->pmu;
++
++	if (attr.use_clockid) {
++		err = perf_event_set_clock(event, attr.clockid);
++		if (err)
++			goto err_alloc;
++	}
++
++	if (pmu->task_ctx_nr == perf_sw_context)
++		event->event_caps |= PERF_EV_CAP_SOFTWARE;
++
++	if (task) {
++		err = down_read_interruptible(&task->signal->exec_update_lock);
++		if (err)
++			goto err_alloc;
++
++		/*
++		 * We must hold exec_update_lock across this and any potential
++		 * perf_install_in_context() call for this new event to
++		 * serialize against exec() altering our credentials (and the
++		 * perf_event_exit_task() that could imply).
++		 */
++		err = -EACCES;
++		if (!perf_check_permission(&attr, task))
++			goto err_cred;
++	}
++
++	/*
++	 * Get the target context (task or percpu):
++	 */
++	ctx = find_get_context(task, event);
++	if (IS_ERR(ctx)) {
++		err = PTR_ERR(ctx);
++		goto err_cred;
++	}
++
++	mutex_lock(&ctx->mutex);
++
++	if (ctx->task == TASK_TOMBSTONE) {
++		err = -ESRCH;
++		goto err_locked;
++	}
++
++	if (!task) {
++		/*
++		 * Check if the @cpu we're creating an event for is online.
++		 *
++		 * We use the perf_cpu_context::ctx::mutex to serialize against
++		 * the hotplug notifiers. See perf_event_{init,exit}_cpu().
++		 */
++		struct perf_cpu_context *cpuctx = per_cpu_ptr(&perf_cpu_context, event->cpu);
++
++		if (!cpuctx->online) {
++			err = -ENODEV;
++			goto err_locked;
++		}
++	}
++
++	if (group_leader) {
++		err = -EINVAL;
++
++		/*
++		 * Do not allow a recursive hierarchy (this new sibling
++		 * becoming part of another group-sibling):
++		 */
++		if (group_leader->group_leader != group_leader)
++			goto err_locked;
++
++		/* All events in a group should have the same clock */
++		if (group_leader->clock != event->clock)
++			goto err_locked;
++
++		/*
++		 * Make sure we're both events for the same CPU;
++		 * grouping events for different CPUs is broken; since
++		 * you can never concurrently schedule them anyhow.
++		 */
++		if (group_leader->cpu != event->cpu)
++			goto err_locked;
++
++		/*
++		 * Make sure we're both on the same context; either task or cpu.
++		 */
++		if (group_leader->ctx != ctx)
++			goto err_locked;
++
++		/*
++		 * Only a group leader can be exclusive or pinned
++		 */
++		if (attr.exclusive || attr.pinned)
++			goto err_locked;
++
++		if (is_software_event(event) &&
++		    !in_software_context(group_leader)) {
++			/*
++			 * If the event is a sw event, but the group_leader
++			 * is on hw context.
++			 *
++			 * Allow the addition of software events to hw
++			 * groups, this is safe because software events
++			 * never fail to schedule.
++			 *
++			 * Note the comment that goes with struct
++			 * perf_event_pmu_context.
++			 */
++			pmu = group_leader->pmu_ctx->pmu;
++		} else if (!is_software_event(event)) {
++			if (is_software_event(group_leader) &&
++			    (group_leader->group_caps & PERF_EV_CAP_SOFTWARE)) {
++				/*
++				 * In case the group is a pure software group, and we
++				 * try to add a hardware event, move the whole group to
++				 * the hardware context.
++				 */
++				move_group = 1;
++			}
++
++			/* Don't allow group of multiple hw events from different pmus */
++			if (!in_software_context(group_leader) &&
++			    group_leader->pmu_ctx->pmu != pmu)
++				goto err_locked;
++		}
++	}
++
++	/*
++	 * Now that we're certain of the pmu; find the pmu_ctx.
++	 */
++	pmu_ctx = find_get_pmu_context(pmu, ctx, event);
++	if (IS_ERR(pmu_ctx)) {
++		err = PTR_ERR(pmu_ctx);
++		goto err_locked;
++	}
++	event->pmu_ctx = pmu_ctx;
++
++	if (output_event) {
++		err = perf_event_set_output(event, output_event);
++		if (err)
++			goto err_context;
++	}
++
++	if (!perf_event_validate_size(event)) {
++		err = -E2BIG;
++		goto err_context;
++	}
++
++	if (perf_need_aux_event(event) && !perf_get_aux_event(event, group_leader)) {
++		err = -EINVAL;
++		goto err_context;
++	}
++
++	/*
++	 * Must be under the same ctx::mutex as perf_install_in_context(),
++	 * because we need to serialize with concurrent event creation.
++	 */
++	if (!exclusive_event_installable(event, ctx)) {
++		err = -EBUSY;
++		goto err_context;
++	}
++
++	WARN_ON_ONCE(ctx->parent_ctx);
++
++	event_file = anon_inode_getfile("[perf_event]", &perf_fops, event, f_flags);
++	if (IS_ERR(event_file)) {
++		err = PTR_ERR(event_file);
++		event_file = NULL;
++		goto err_context;
++	}
++
++	/*
++	 * This is the point on no return; we cannot fail hereafter. This is
++	 * where we start modifying current state.
++	 */
++
++	if (move_group) {
++		perf_remove_from_context(group_leader, 0);
++		put_pmu_ctx(group_leader->pmu_ctx);
++
++		for_each_sibling_event(sibling, group_leader) {
++			perf_remove_from_context(sibling, 0);
++			put_pmu_ctx(sibling->pmu_ctx);
++		}
++
++		/*
++		 * Install the group siblings before the group leader.
++		 *
++		 * Because a group leader will try and install the entire group
++		 * (through the sibling list, which is still in-tact), we can
++		 * end up with siblings installed in the wrong context.
++		 *
++		 * By installing siblings first we NO-OP because they're not
++		 * reachable through the group lists.
++		 */
++		for_each_sibling_event(sibling, group_leader) {
++			sibling->pmu_ctx = pmu_ctx;
++			get_pmu_ctx(pmu_ctx);
++			perf_event__state_init(sibling);
++			perf_install_in_context(ctx, sibling, sibling->cpu);
++		}
++
++		/*
++		 * Removing from the context ends up with disabled
++		 * event. What we want here is event in the initial
++		 * startup state, ready to be add into new context.
++		 */
++		group_leader->pmu_ctx = pmu_ctx;
++		get_pmu_ctx(pmu_ctx);
++		perf_event__state_init(group_leader);
++		perf_install_in_context(ctx, group_leader, group_leader->cpu);
++	}
++
++	/*
++	 * Precalculate sample_data sizes; do while holding ctx::mutex such
++	 * that we're serialized against further additions and before
++	 * perf_install_in_context() which is the point the event is active and
++	 * can use these values.
++	 */
++	perf_event__header_size(event);
++	perf_event__id_header_size(event);
++
++	event->owner = current;
++
++	perf_install_in_context(ctx, event, event->cpu);
++	perf_unpin_context(ctx);
++
++	mutex_unlock(&ctx->mutex);
++
++	if (task) {
++		up_read(&task->signal->exec_update_lock);
++		put_task_struct(task);
++	}
++
++	mutex_lock(&current->perf_event_mutex);
++	list_add_tail(&event->owner_entry, &current->perf_event_list);
++	mutex_unlock(&current->perf_event_mutex);
++
++	/*
++	 * Drop the reference on the group_event after placing the
++	 * new event on the sibling_list. This ensures destruction
++	 * of the group leader will find the pointer to itself in
++	 * perf_group_detach().
++	 */
++	fdput(group);
++	fd_install(event_fd, event_file);
++	return event_fd;
++
++err_context:
++	put_pmu_ctx(event->pmu_ctx);
++	event->pmu_ctx = NULL; /* _free_event() */
++err_locked:
++	mutex_unlock(&ctx->mutex);
++	perf_unpin_context(ctx);
++	put_ctx(ctx);
++err_cred:
++	if (task)
++		up_read(&task->signal->exec_update_lock);
++err_alloc:
++	free_event(event);
++err_task:
++	if (task)
++		put_task_struct(task);
++err_group_fd:
++	fdput(group);
++err_fd:
++	put_unused_fd(event_fd);
++	return err;
++}
++EXPORT_SYMBOL_GPL(kmig__perf_event_open);
+--- a/kernel/kthread.c
++++ b/kernel/kthread.c
+@@ -541,6 +541,7 @@
+ {
+ 	__kthread_bind_mask(p, mask, TASK_UNINTERRUPTIBLE);
+ }
++EXPORT_SYMBOL(kthread_bind_mask);
+ 
+ /**
+  * kthread_bind - bind a just-created kthread to a cpu.
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -853,6 +853,7 @@
+ 		put_dev_pagemap(ctx.pgmap);
+ 	return page;
+ }
++EXPORT_SYMBOL_GPL(follow_page);
+ 
+ static int get_gate_page(struct mm_struct *mm, unsigned long address,
+ 		unsigned int gup_flags, struct vm_area_struct **vma,
+--- a/mm/mmu_notifier.c
++++ b/mm/mmu_notifier.c
+@@ -401,6 +401,7 @@
+ 
+ 	return young;
+ }
++EXPORT_SYMBOL(__mmu_notifier_clear_young);
+ 
+ int __mmu_notifier_test_young(struct mm_struct *mm,
+ 			      unsigned long address)
+@@ -423,6 +424,7 @@
+ 
+ 	return young;
+ }
++EXPORT_SYMBOL(__mmu_notifier_test_young);
+ 
+ void __mmu_notifier_change_pte(struct mm_struct *mm, unsigned long address,
+ 			       pte_t pte)
+--- a/mm/pagewalk.c
++++ b/mm/pagewalk.c
+@@ -525,6 +525,7 @@
+ 	} while (start = next, start < end);
+ 	return err;
+ }
++EXPORT_SYMBOL(walk_page_range);
+ 
+ /**
+  * walk_page_range_novma - walk a range of pagetables not backed by a vma
+--- a/mm/pgtable-generic.c
++++ b/mm/pgtable-generic.c
+@@ -378,3 +378,4 @@
+ 	pte_unmap_unlock(pte, ptl);
+ 	goto again;
+ }
++EXPORT_SYMBOL(__pte_offset_map_lock);
+--- a/arch/x86/mm/pgtable.c
++++ b/arch/x86/mm/pgtable.c
+@@ -562,6 +562,7 @@
+ 
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(ptep_test_and_clear_young);
+ 
+ #if defined(CONFIG_TRANSPARENT_HUGEPAGE) || defined(CONFIG_ARCH_HAS_NONLEAF_PMD_YOUNG)
+ int pmdp_test_and_clear_young(struct vm_area_struct *vma,
+@@ -575,6 +576,7 @@
+ 
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(pmdp_test_and_clear_young);
+ #endif
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+--- a/include/linux/migrate.h
++++ b/include/linux/migrate.h
+@@ -141,6 +141,10 @@
+ 		((unsigned long)page->mapping - PAGE_MAPPING_MOVABLE);
+ }
+ 
++unsigned int migration_rl_avail(unsigned int nr_pages);
++unsigned int migration_rl_avail_wait(unsigned int nr_pages);
++void migration_rl_charge(unsigned int nr_pages);
++
+ #ifdef CONFIG_NUMA_BALANCING
+ int migrate_misplaced_page(struct page *page, struct vm_area_struct *vma,
+ 			   int node);
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -14,6 +14,7 @@
+  */
+ 
+ #include <linux/migrate.h>
++#include <linux/kthread.h>
+ #include <linux/export.h>
+ #include <linux/swap.h>
+ #include <linux/swapops.h>
+@@ -2447,6 +2448,94 @@
+ 	return kernel_move_pages(pid, nr_pages, pages, nodes, status, flags);
+ }
+ 
++/*
++ * Migration rate limiter: promotion, demotion and NUMA-fault migration
++ * consume one global budget of /proc/sys/vm/migration_rate_limit_MBps
++ * (0 = unlimited).
++ */
++unsigned int sysctl_migration_rate_limit_mbps;
++static DEFINE_SPINLOCK(mig_rl_lock);
++static unsigned long mig_rl_win_start;
++static unsigned long mig_rl_win_pages;
++
++/* How many pages may still migrate in the current 1-second window.
++ * This only queries the budget; callers charge the pages that actually
++ * moved with migration_rl_charge(). */
++unsigned int migration_rl_avail(unsigned int nr_pages)
++{
++	unsigned long limit, flags, used;
++	unsigned int mbps = READ_ONCE(sysctl_migration_rate_limit_mbps);
++
++	if (!mbps)
++		return nr_pages;
++	limit = (unsigned long)mbps << (20 - PAGE_SHIFT);
++
++	spin_lock_irqsave(&mig_rl_lock, flags);
++	if (!mig_rl_win_start || time_after(jiffies, mig_rl_win_start + HZ)) {
++		mig_rl_win_start = jiffies ? jiffies : 1;
++		mig_rl_win_pages = 0;
++	}
++	used = mig_rl_win_pages;
++	spin_unlock_irqrestore(&mig_rl_lock, flags);
++
++	if (used >= limit)
++		return 0;
++	return min_t(unsigned long, nr_pages, limit - used);
++}
++
++/*
++ * Reclaim-context variant: waits for the next window when the current one
++ * is exhausted. Returns 0 only when the calling kthread is asked to stop.
++ */
++unsigned int migration_rl_avail_wait(unsigned int nr_pages)
++{
++	unsigned int allow;
++
++	if (!READ_ONCE(sysctl_migration_rate_limit_mbps))
++		return nr_pages;
++	while (!(allow = migration_rl_avail(nr_pages))) {
++		if (kthread_should_stop())
++			return 0;
++		schedule_timeout_uninterruptible(HZ / 10);
++	}
++	return allow;
++}
++
++/* Charge pages that actually migrated against the current window. */
++void migration_rl_charge(unsigned int nr_pages)
++{
++	unsigned long flags;
++
++	if (!READ_ONCE(sysctl_migration_rate_limit_mbps) || !nr_pages)
++		return;
++
++	spin_lock_irqsave(&mig_rl_lock, flags);
++	if (!mig_rl_win_start || time_after(jiffies, mig_rl_win_start + HZ)) {
++		mig_rl_win_start = jiffies ? jiffies : 1;
++		mig_rl_win_pages = 0;
++	}
++	mig_rl_win_pages += nr_pages;
++	spin_unlock_irqrestore(&mig_rl_lock, flags);
++}
++
++static struct ctl_table mig_rl_table[] = {
++	{
++		.procname	= "migration_rate_limit_MBps",
++		.data		= &sysctl_migration_rate_limit_mbps,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec,
++	},
++	{}
++};
++
++static int __init mig_rl_init(void)
++{
++	register_sysctl("vm", mig_rl_table);
++	return 0;
++}
++late_initcall(mig_rl_init);
++
+ #ifdef CONFIG_NUMA_BALANCING
+ /*
+  * Returns true if this is a safe migration target node for misplaced NUMA
+@@ -2561,6 +2650,10 @@
+ 	if (page_is_file_lru(page) && PageDirty(page))
+ 		goto out;
+ 
++	/* migration rate limit: queried here, charged on success below */
++	if (!migration_rl_avail(nr_pages))
++		goto out;
++
+ 	isolated = numamigrate_isolate_page(pgdat, page);
+ 	if (!isolated)
+ 		goto out;
+@@ -2579,6 +2672,7 @@
+ 		isolated = 0;
+ 	}
+ 	if (nr_succeeded) {
++		migration_rl_charge(nr_succeeded);
+ 		count_vm_numa_events(NUMA_PAGE_MIGRATE, nr_succeeded);
+ 		if (!node_is_toptier(page_to_nid(page)) && node_is_toptier(node))
+ 			mod_node_page_state(pgdat, PGPROMOTE_SUCCESS,
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1643,6 +1643,32 @@
+ }
+ 
+ /*
++ * Trim @folios to the unified migration budget. Folios over budget are moved
++ * to @overflow, which the callers treat as not migrated. Returns the number
++ * of pages kept.
++ */
++static unsigned int migration_rl_trim(struct list_head *folios,
++				      struct list_head *overflow)
++{
++	struct folio *folio, *tmp;
++	unsigned int nr = 0, allow, kept = 0;
++
++	list_for_each_entry(folio, folios, lru)
++		nr += folio_nr_pages(folio);
++	/* kswapd waits for budget; direct reclaim takes what is left */
++	allow = current_is_kswapd() ? migration_rl_avail_wait(nr) : migration_rl_avail(nr);
++	if (allow >= nr)
++		return nr;
++	list_for_each_entry_safe(folio, tmp, folios, lru) {
++		if (kept + folio_nr_pages(folio) > allow)
++			list_move(&folio->lru, overflow);
++		else
++			kept += folio_nr_pages(folio);
++	}
++	return kept;
++}
++
++/*
+  * Take folios on @demote_folios and attempt to demote them to another node.
+  * Folios which are not demoted are left on @demote_folios.
+  */
+@@ -1673,13 +1699,21 @@
+ 
+ 	node_get_allowed_targets(pgdat, &allowed_mask);
+ 
+-	/* Demotion ignores all cpuset and mempolicy settings */
+-	migrate_pages(demote_folios, alloc_migrate_folio, NULL,
++	{
++		LIST_HEAD(rl_overflow);
++
++		migration_rl_trim(demote_folios, &rl_overflow);
++		/* Demotion ignores all cpuset and mempolicy settings */
++		migrate_pages(demote_folios, alloc_migrate_folio, NULL,
+ 		      (unsigned long)&mtc, MIGRATE_ASYNC, MR_DEMOTION,
+ 		      &nr_succeeded);
+ 
+ 	__count_vm_events(PGDEMOTE_KSWAPD + reclaimer_offset(), nr_succeeded);
+ 
++		migration_rl_charge(nr_succeeded);
++		list_splice(&rl_overflow, demote_folios);
++	}
++
+ 	return nr_succeeded;
+ }
+ 
+@@ -1715,10 +1749,18 @@
+ 	if (target_nid == NUMA_NO_NODE)
+ 		return 0;
+ 
+-	/* Promotion ignores all cpuset and mempolicy settings */
+-	migrate_pages(promote_folios, alloc_migrate_folio, NULL,
+-		      (unsigned long)&mtc, MIGRATE_ASYNC, MR_PROMOTION,
+-		      &nr_succeeded);
++	{
++		LIST_HEAD(rl_overflow);
++
++		migration_rl_trim(promote_folios, &rl_overflow);
++		/* Promotion ignores all cpuset and mempolicy settings */
++		migrate_pages(promote_folios, alloc_migrate_folio, NULL,
++			      (unsigned long)&mtc, MIGRATE_ASYNC, MR_PROMOTION,
++			      &nr_succeeded);
++
++		migration_rl_charge(nr_succeeded);
++		list_splice(&rl_overflow, promote_folios);
++	}
+ 
+ 	__count_vm_events(PGPROMOTE, nr_succeeded);
+ 
+--- a/mm/memory-tiers.c
++++ b/mm/memory-tiers.c
+@@ -730,6 +730,14 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/* Reset the reclaim-failure count of every node; kswapd can be woken again. */
++	if (numa_demotion_enabled) {
++		pg_data_t *pgdat;
++
++		for_each_online_pgdat(pgdat)
++			pgdat->kswapd_failures = 0;
++	}
++
+ 	return count;
+ }
+ 

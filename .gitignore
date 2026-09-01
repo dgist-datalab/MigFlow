@@ -1,0 +1,14 @@
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+*.order
+*.symvers
+.tmp_versions/
+Module.markers
+modules.order
+daemon/umigratord
+results/
+workloads/silo/
+jemalloc.stats

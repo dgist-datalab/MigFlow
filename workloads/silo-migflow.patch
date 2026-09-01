@@ -1,0 +1,152 @@
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -1,3 +1,3 @@
+ [submodule "masstree"]
+ 	path = masstree
+-	url = git://github.com/kohler/masstree-beta.git
++	url = https://github.com/kohler/masstree-beta.git
+--- a/Makefile
++++ b/Makefile
+@@ -75,8 +75,10 @@
+ 	$(error invalid mode)
+ endif
+ 
+-CXXFLAGS := -g -Wall -std=c++0x
++CXXFLAGS := -g -Wall -std=c++0x -Wno-format-truncation -Wno-maybe-uninitialized -Wno-unused-variable
++CXXFLAGS += -Wno-address-of-packed-member -Wno-class-memaccess
+ CXXFLAGS += -MD -Ithird-party/lz4 -DCONFIG_H=\"$(CONFIG_H)\"
++
+ ifeq ($(DEBUG_S),1)
+         CXXFLAGS += -fno-omit-frame-pointer -DDEBUG
+ else
+--- a/macros.h
++++ b/macros.h
+@@ -24,7 +24,7 @@
+ //#define TUPLE_LOCK_OWNERSHIP_CHECKING
+ //#define MEMCHECK_MAGIC 0xFF
+ //#define TUPLE_MAGIC
+-//#define PROTO2_CAN_DISABLE_GC
++#define PROTO2_CAN_DISABLE_GC
+ //#define PROTO2_CAN_DISABLE_SNAPSHOTS
+ //#define USE_PERF_CTRS
+ 
+--- a/allocator.cc
++++ b/allocator.cc
+@@ -252,8 +252,8 @@
+       ALWAYS_ASSERT(false);
+     }
+     INVARIANT(x == mypx);
+-    const int advice =
+-      UseMAdvWillNeed() ? MADV_HUGEPAGE | MADV_WILLNEED : MADV_HUGEPAGE;
++    // 4 KB pages, no MADV_HUGEPAGE
++    const int advice = MADV_NORMAL;
+     if (madvise(x, hugepgsize, advice)) {
+       perror("madvise");
+       ALWAYS_ASSERT(false);
+@@ -345,7 +345,7 @@
+   }
+   ALWAYS_ASSERT(x == pc.region_begin);
+   const int advice =
+-    UseMAdvWillNeed() ? MADV_HUGEPAGE | MADV_WILLNEED : MADV_HUGEPAGE;
++    UseMAdvWillNeed() ? MADV_WILLNEED : MADV_NORMAL;
+   if (madvise(x, sz, advice)) {
+     perror("madvise");
+     ALWAYS_ASSERT(false);
+--- a/rcu.cc
++++ b/rcu.cc
+@@ -287,12 +287,7 @@
+ {
+   sync &s = mysync();
+   s.set_pin_cpu(cpu);
+-  auto node = numa_node_of_cpu(cpu);
+-  // pin to node
+-  ALWAYS_ASSERT(!numa_run_on_node(node));
+-  // is numa_run_on_node() guaranteed to take effect immediately?
+-  ALWAYS_ASSERT(!sched_yield());
+-  // release current thread-local cache back to allocator
++  // no per-thread NUMA pinning; release the thread-local cache
+   s.do_release();
+ }
+ 
+--- a/ticker.h
++++ b/ticker.h
+@@ -180,6 +180,14 @@
+   void
+   tickerloop()
+   {
++    // clear the CPU affinity of the ticker thread
++    cpu_set_t mask;
++    CPU_ZERO(&mask);
++    for (int i=0;i<CPU_SETSIZE;i++)
++      CPU_SET(i,&mask);
++    int ret = sched_setaffinity(0, sizeof(mask), &mask);
++    ALWAYS_ASSERT(!ret);
++
+     // runs as daemon
+     util::timer loop_timer;
+     struct timespec t;
+--- a/benchmarks/bench.h
++++ b/benchmarks/bench.h
+@@ -113,7 +113,7 @@
+       r(seed), db(db), open_tables(open_tables),
+       barrier_a(barrier_a), barrier_b(barrier_b),
+       // the ntxn_* numbers are per worker
+-      ntxn_commits(0), ntxn_aborts(0),
++      ntxn_commits(0), ntxn_aborts(0), bench_end(0),
+       latency_numer_us(0),
+       backoff_shifts(0), // spin between [0, 2^backoff_shifts) times before retry
+       size_delta(0)
+@@ -147,6 +147,7 @@
+ 
+   inline size_t get_ntxn_commits() const { return ntxn_commits; }
+   inline size_t get_ntxn_aborts() const { return ntxn_aborts; }
++  inline size_t check_bench_end() const { return bench_end; }
+ 
+   inline uint64_t get_latency_numer_us() const { return latency_numer_us; }
+ 
+@@ -188,6 +189,7 @@
+ private:
+   size_t ntxn_commits;
+   size_t ntxn_aborts;
++  size_t bench_end;
+   uint64_t latency_numer_us;
+   unsigned backoff_shifts;
+ 
+--- a/benchmarks/bench.cc
++++ b/benchmarks/bench.cc
+@@ -159,6 +159,7 @@
+       d -= workload[i].frequency;
+     }
+   }
++  bench_end = 1;
+ }
+ 
+ void
+@@ -235,8 +236,25 @@
+   barrier_a.wait_for(); // wait for all threads to start up
+   timer t, t_nosync;
+   barrier_b.count_down(); // bombs away!
+-  if (run_mode == RUNMODE_TIME) {
+-    sleep(runtime);
++  // Print the throughput every 5 seconds until the workers finish their
++  // transactions (RUNMODE_OPS) or the runtime has elapsed (RUNMODE_TIME).
++  {
++    unsigned long elapsed_time = 0;
++    size_t commits = 0;
++    size_t end = 0;
++    do {
++      sleep(5);
++      size_t current_commits = 0;
++      for (size_t i = 0; i < nthreads; i++)
++        current_commits += workers[i]->get_ntxn_commits();
++      elapsed_time += 5;
++      const double tmp_thput = (double)(current_commits - commits) / 5.0;
++      cerr << "time: " << elapsed_time << " throughput: " << tmp_thput << " ops/sec" << endl;
++      commits = current_commits;
++      for (size_t i = 0; i < nthreads; i++)
++        if (workers[i]->check_bench_end())
++          end = 1;
++    } while (!end && (run_mode != RUNMODE_TIME || elapsed_time < runtime));
+     running = false;
+   }
+   __sync_synchronize();
