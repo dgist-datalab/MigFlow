@@ -7,7 +7,7 @@ systems (H-NUMA), i.e. multi-socket machines whose sockets combine DRAM with a
 slower memory device such as persistent memory or CXL-attached memory. Its
 policies are derived from **MigOpt**, a near-optimal offline placement
 algorithm formulated as a minimum-cost maximum-flow problem.
-To realize these policies efficiently in a practical system, MigFlow employs lightweight mechanisms:
+To realize these policies efficiently in a practical system, MigFlow employs three lightweight mechanisms:
 
 * **Lowest-latency-first allocation** places new pages in the fastest tier that
   has free space, regardless of socket locality.
@@ -16,9 +16,9 @@ To realize these policies efficiently in a practical system, MigFlow employs lig
 * **Cost-benefit promotion** promotes a page only when the latency benefit of
   the faster tier outweighs the migration cost.
 
-MigFlow is implemented as a small kernel patch, a kernel module and a userspace
+MigFlow is implemented as a small kernel patch, a kernel module, and a userspace
 daemon on a real four-tier machine (DRAM and Intel Optane persistent memory on
-two sockets), which enables us to measure execution time, throughput and
+two sockets), which enables us to measure execution time, throughput, and
 migration traffic of real applications.
 
 The paper that introduces MigOpt and MigFlow is currently under submission to
@@ -41,7 +41,7 @@ kernel (Linux 6.6.0) and consists of three parts:
   samples memory accesses of the target with PEBS.
 * **Daemon** (`daemon/`, `umigratord`): launches the application, keeps a
   per-page hotness histogram from the module's records, and runs quick
-  demotion, cost-benefit promotion and LFU demotion under an 800 MB / 10 s
+  demotion, cost-benefit promotion, and LFU demotion under an 800 MB / 10 s
   migration budget using `move_pages(2)`.
 
 For evaluation we use **Silo** running **TPC-C** as the workload, and
@@ -78,14 +78,14 @@ The hardware requirements for executing MigFlow are as follows.
   (`libnuma-dev`, `libjemalloc-dev`, `libdb++-dev`)
 
 For artifact evaluation you are given a **user account with sudo** on our
-evaluation machine, where the kernel, numactl and the memory topology are
+evaluation machine, where the kernel, numactl, and the memory topology are
 already set up. In that case, skip to **step 4** of the installation below.
 The full setup is described for completeness and for reproducing the
 environment on another machine.
 
 ## Installation & Compilation
 
-Since the experiments replace the kernel, change the memory topology and load
+Since the experiments replace the kernel, change the memory topology, and load
 a kernel module, a dedicated machine is required. There are five steps to
 install and run MigFlow:
 
@@ -203,7 +203,7 @@ node 3 size: 129024 MB
 
 ### 4. Build the MigFlow Module and Daemon
 
-> **On our evaluation server, start here.** The kernel, numactl and the
+> **On our evaluation server, start here.** The kernel, numactl, and the
 > memory topology (steps 1-3) are already set up; clone the repository as in
 > step 0 and continue from this step.
 
@@ -327,7 +327,7 @@ a compact overview of key components.
 
 During the experiment, you can observe how MigFlow places new pages in the
 fast tiers, demotes cooled pages and promotes hot pages, and at the end you
-get the execution time, the TPC-C throughput and the migration volume.
+get the execution time, the TPC-C throughput, and the migration volume.
 
 Everything a run prints on the terminal is also written to a log file in the
 **`results/`** directory of the repository, which is created on the first run:
